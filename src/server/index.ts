@@ -299,8 +299,8 @@ async function startServer() {
             process.exit(1);
         }
 
-        // Initialize moderation service in background (polls until Ollama is ready)
-        // Server starts immediately; moderation becomes available once Ollama responds
+        // Initialize moderation service in background (verifies the Gemini model is reachable)
+        // Server starts immediately; moderation becomes available once the model responds
         console.log('[Startup] Initializing moderation service (background)...');
         moderationService.initialize().then(() => {
             console.log('[Startup] Moderation service ready');

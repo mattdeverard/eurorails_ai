@@ -457,7 +457,7 @@ router.get('/health', asyncHandler(async (req: Request, res: Response) => {
     data: {
       moderation: {
         initialized: moderationStatus.initialized,
-        ollamaUrl: moderationStatus.ollamaUrl,
+        provider: moderationStatus.provider,
         modelName: moderationStatus.modelName,
       },
       service: 'chat-api',

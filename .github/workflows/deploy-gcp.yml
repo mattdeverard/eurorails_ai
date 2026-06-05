@@ -1,0 +1,70 @@
+name: Deploy to Cloud Run
+
+# Deploys the EuroRails showcase to Google Cloud Run.
+# Authenticates via Workload Identity Federation (no long-lived JSON keys).
+# Run scripts/gcp/setup.sh once to provision GCP, then set the repo
+# variables/secrets it prints. See docs/deploy-gcp.md.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # required for Workload Identity Federation
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      IMAGE: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GCP_AR_REPO }}/${{ vars.GCP_SERVICE_NAME }}:${{ github.sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOYER_SA }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev --quiet
+
+      - name: Build image
+        # VITE_* args are baked into the client bundle at build time (webpack DefinePlugin),
+        # so they must match the final public URL for CORS + API calls to work.
+        run: |
+          docker build \
+            -f Dockerfile.prod \
+            --build-arg VITE_API_BASE_URL="${{ vars.PUBLIC_URL }}" \
+            --build-arg VITE_SOCKET_URL="${{ vars.PUBLIC_URL }}" \
+            -t "$IMAGE" .
+
+      - name: Push image
+        run: docker push "$IMAGE"
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy "${{ vars.GCP_SERVICE_NAME }}" \
+            --image="$IMAGE" \
+            --region="${{ vars.GCP_REGION }}" \
+            --platform=managed \
+            --service-account="${{ vars.GCP_RUNTIME_SA }}" \
+            --allow-unauthenticated \
+            --add-cloudsql-instances="${{ vars.GCP_SQL_CONNECTION_NAME }}" \
+            --port=8080 \
+            --cpu=1 --memory=512Mi \
+            --min-instances=0 --max-instances=4 \
+            --set-env-vars="NODE_ENV=production,DB_HOST=/cloudsql/${{ vars.GCP_SQL_CONNECTION_NAME }},DB_PORT=5432,DB_USER=${{ vars.GCP_DB_USER }},DB_NAME=${{ vars.GCP_DB_NAME }},CLIENT_URL=${{ vars.PUBLIC_URL }},API_BASE_URL=${{ vars.PUBLIC_URL }},MODERATION_MODEL=gemini-2.0-flash" \
+            --set-secrets="DB_PASSWORD=eurorails-db-password:latest,SESSION_SECRET=eurorails-session-secret:latest,GOOGLE_AI_API_KEY=eurorails-google-ai-key:latest,ANTHROPIC_API_KEY=eurorails-anthropic-key:latest,RESEND_API_KEY=eurorails-resend-key:latest"
+
+      - name: Show service URL
+        run: |
+          gcloud run services describe "${{ vars.GCP_SERVICE_NAME }}" \
+            --region="${{ vars.GCP_REGION }}" --format='value(status.url)'

@@ -21,29 +21,9 @@ services:
       - db:/var/lib/postgresql
       - ${INIT_SCRIPTS_DIR:-./db/scripts}:/docker-entrypoint-initdb.d:ro
       - ./db/migrations:/migrations
-  ollama:
-    build:
-      context: .
-      dockerfile: Dockerfile.ollama
-    restart: unless-stopped
-    ports:
-      - "11434:11434"
-    environment:
-      - OLLAMA_HOST=0.0.0.0
-      - OLLAMA_MODEL=${LLAMA_GUARD_MODEL:-llama-guard3:1b}
-    volumes:
-      - ollama_data:/root/.ollama
-    healthcheck:
-      test: ["CMD-SHELL", "ollama list | grep -q llama-guard"]
-      interval: 10s
-      timeout: 5s
-      retries: 60
-      start_period: 60s
   app:
     depends_on:
       postgresdb:
-        condition: service_healthy
-      ollama:
         condition: service_healthy
     build: 
       context: .
@@ -63,10 +43,10 @@ services:
       - DB_NAME_TEST=${DB_NAME_TEST:-${DB_NAME}}
       - DB_PORT=$DB_PORT
       - NODE_ENV=${NODE_ENV:-development}
-      - LLAMA_GUARD_URL=http://ollama:11434
+      - GOOGLE_AI_API_KEY=$GOOGLE_AI_API_KEY
+      - MODERATION_MODEL=${MODERATION_MODEL:-gemini-2.0-flash}
     stdin_open: true
     tty: true
 
 volumes:
   db:
-  ollama_data:

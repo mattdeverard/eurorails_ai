@@ -1,7 +1,7 @@
 /**
  * ModerationService Unit Tests
- * Tests for content moderation via Llama Guard model served by Ollama.
- * Llama Guard 3 returns binary "safe" / "unsafe\nS10" responses.
+ * Tests for content moderation via Google's Gemini API.
+ * The model returns a structured JSON verdict { safe, categories }.
  */
 
 import { ModerationService } from '../services/moderationService';
@@ -16,13 +16,29 @@ function mockFetchResponse(body: any, status = 200): Response {
   } as Response;
 }
 
+// Helper to build a Gemini generateContent response wrapping a verdict object
+function mockGeminiVerdict(verdict: { safe: boolean; categories: string[] }): Response {
+  return mockFetchResponse({
+    candidates: [
+      {
+        content: { parts: [{ text: JSON.stringify(verdict) }] },
+        finishReason: 'STOP',
+      },
+    ],
+  });
+}
+
 describe('ModerationService', () => {
   let service: ModerationService;
   const originalFetch = global.fetch;
   const originalEnv = process.env;
 
   beforeEach(() => {
-    process.env = { ...originalEnv, LLAMA_GUARD_URL: 'http://localhost:11434', LLAMA_GUARD_MODEL: 'llama-guard3:1b' };
+    process.env = {
+      ...originalEnv,
+      GOOGLE_AI_API_KEY: 'test-api-key',
+      MODERATION_MODEL: 'gemini-2.0-flash',
+    };
     service = new ModerationService();
     global.fetch = jest.fn();
   });
@@ -34,26 +50,23 @@ describe('ModerationService', () => {
   });
 
   describe('initialize', () => {
-    it('should initialize successfully when Ollama has the model', async () => {
+    it('should initialize successfully when the model is reachable', async () => {
       (global.fetch as jest.Mock).mockResolvedValue(
-        mockFetchResponse({ name: 'llama-guard3:1b' })
+        mockFetchResponse({ name: 'models/gemini-2.0-flash' })
       );
 
       await service.initialize(1000);
 
       expect(service.isReady()).toBe(true);
       expect(global.fetch).toHaveBeenCalledWith(
-        'http://localhost:11434/api/show',
-        expect.objectContaining({
-          method: 'POST',
-          body: JSON.stringify({ name: 'llama-guard3:1b' }),
-        })
+        'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash?key=test-api-key',
+        expect.objectContaining({ method: 'GET' })
       );
     });
 
     it('should skip if already initialized', async () => {
       (global.fetch as jest.Mock).mockResolvedValue(
-        mockFetchResponse({ name: 'llama-guard3:1b' })
+        mockFetchResponse({ name: 'models/gemini-2.0-flash' })
       );
 
       await service.initialize(1000);
@@ -62,7 +75,18 @@ describe('ModerationService', () => {
       expect(global.fetch).toHaveBeenCalledTimes(1);
     });
 
-    it('should throw when Ollama server is unreachable', async () => {
+    it('should throw when no API key is configured', async () => {
+      delete process.env.GOOGLE_AI_API_KEY;
+      service = new ModerationService();
+
+      await expect(service.initialize(1000)).rejects.toThrow(
+        'MODERATION_INITIALIZATION_FAILED'
+      );
+      expect(service.isReady()).toBe(false);
+      expect(global.fetch).not.toHaveBeenCalled();
+    });
+
+    it('should throw when the API is unreachable', async () => {
       (global.fetch as jest.Mock).mockRejectedValue(new Error('ECONNREFUSED'));
 
       await expect(service.initialize(0)).rejects.toThrow(
@@ -86,7 +110,7 @@ describe('ModerationService', () => {
   describe('checkMessage', () => {
     beforeEach(async () => {
       (global.fetch as jest.Mock).mockResolvedValueOnce(
-        mockFetchResponse({ name: 'llama-guard3:1b' })
+        mockFetchResponse({ name: 'models/gemini-2.0-flash' })
       );
       await service.initialize(1000);
     });
@@ -106,7 +130,7 @@ describe('ModerationService', () => {
 
     it('should approve safe messages', async () => {
       (global.fetch as jest.Mock).mockResolvedValueOnce(
-        mockFetchResponse({ response: 'safe' })
+        mockGeminiVerdict({ safe: true, categories: [] })
       );
 
       const result = await service.checkMessage('Hello, how are you?');
@@ -117,7 +141,7 @@ describe('ModerationService', () => {
 
     it('should reject unsafe messages with category', async () => {
       (global.fetch as jest.Mock).mockResolvedValueOnce(
-        mockFetchResponse({ response: 'unsafe\nS10' })
+        mockGeminiVerdict({ safe: false, categories: ['S10'] })
       );
 
       const result = await service.checkMessage('some hateful content');
@@ -128,13 +152,24 @@ describe('ModerationService', () => {
 
     it('should reject unsafe messages with multiple categories', async () => {
       (global.fetch as jest.Mock).mockResolvedValueOnce(
-        mockFetchResponse({ response: 'unsafe\nS1,S10' })
+        mockGeminiVerdict({ safe: false, categories: ['S1', 'S10'] })
       );
 
       const result = await service.checkMessage('violent and hateful content');
 
       expect(result.isAppropriate).toBe(false);
       expect(result.violatedCategories).toEqual(['S1', 'S10']);
+    });
+
+    it('should reject when Gemini blocks the prompt', async () => {
+      (global.fetch as jest.Mock).mockResolvedValueOnce(
+        mockFetchResponse({ promptFeedback: { blockReason: 'SAFETY' } })
+      );
+
+      const result = await service.checkMessage('blocked content');
+
+      expect(result.isAppropriate).toBe(false);
+      expect(result.violatedCategories).toEqual([]);
     });
 
     it('should fail closed on API error', async () => {
@@ -159,7 +194,9 @@ describe('ModerationService', () => {
 
     it('should fail closed on unparseable response', async () => {
       (global.fetch as jest.Mock).mockResolvedValueOnce(
-        mockFetchResponse({ response: 'gibberish output' })
+        mockFetchResponse({
+          candidates: [{ content: { parts: [{ text: 'gibberish output' }] } }],
+        })
       );
 
       const result = await service.checkMessage('test message');
@@ -167,24 +204,27 @@ describe('ModerationService', () => {
       expect(result.isAppropriate).toBe(false);
     });
 
-    it('should send correct prompt format to Ollama', async () => {
+    it('should send correct request format to Gemini', async () => {
       (global.fetch as jest.Mock).mockResolvedValueOnce(
-        mockFetchResponse({ response: 'safe' })
+        mockGeminiVerdict({ safe: true, categories: [] })
       );
 
       await service.checkMessage('Hello world');
 
       const generateCall = (global.fetch as jest.Mock).mock.calls.find(
-        (call: any[]) => call[0].includes('/api/generate')
+        (call: any[]) => call[0].includes(':generateContent')
       );
       expect(generateCall).toBeDefined();
 
       const body = JSON.parse(generateCall[1].body);
-      expect(body.model).toBe('llama-guard3:1b');
-      expect(body.stream).toBe(false);
-      expect(body.prompt).toContain('Hello world');
-      expect(body.prompt).toContain('<BEGIN UNSAFE CONTENT CATEGORIES>');
-      expect(body.prompt).toContain('<END UNSAFE CONTENT CATEGORIES>');
+      expect(body.contents[0].parts[0].text).toContain('Hello world');
+      expect(body.systemInstruction.parts[0].text).toContain(
+        '<BEGIN UNSAFE CONTENT CATEGORIES>'
+      );
+      expect(body.systemInstruction.parts[0].text).toContain(
+        '<END UNSAFE CONTENT CATEGORIES>'
+      );
+      expect(body.generationConfig.responseMimeType).toBe('application/json');
     });
   });
 
@@ -197,12 +237,12 @@ describe('ModerationService', () => {
   });
 
   describe('getHealthStatus', () => {
-    it('should return Ollama config', () => {
+    it('should return provider config', () => {
       const status = service.getHealthStatus();
 
       expect(status.initialized).toBe(false);
-      expect(status.ollamaUrl).toBe('http://localhost:11434');
-      expect(status.modelName).toBe('llama-guard3:1b');
+      expect(status.provider).toBe('google-gemini');
+      expect(status.modelName).toBe('gemini-2.0-flash');
     });
   });
 });
